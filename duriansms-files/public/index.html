@@ -62,20 +62,26 @@ let activeNumbers = JSON.parse(localStorage.getItem('active_numbers') || '[]');
 let refreshTimers = {};
 let unsubscribeBalance = null;
 let isAdmin = false;
-let adminDataLoaded = false; // NEW: track when admin status is confirmed
+
+// ── CRITICAL: Check admin status from Firestore role field ──
+function checkAdminStatus(userData) {
+  return userData && userData.role === 'admin';
+}
 
 // ── AUTH STATE ──
 onAuthStateChanged(auth, async (user) => {
   if (user) {
     currentUser = user;
     showPanel();
+    // CRITICAL: await loadUserData fully before initApp
+    // so isAdmin is set before any UI renders
     await loadUserData(user);
     initApp();
   } else {
     currentUser = null;
     currentUserData = null;
     isAdmin = false;
-    adminDataLoaded = false;
+    Object.values(refreshTimers).forEach(t => clearInterval(t));
     if (unsubscribeBalance) { unsubscribeBalance(); unsubscribeBalance = null; }
     showAuth();
   }
@@ -140,34 +146,35 @@ function firebaseErrMsg(code) {
 // ── USER DATA / BALANCE ──
 async function loadUserData(user) {
   const ref = doc(db, 'users', user.uid);
-  // FIX: First do a direct getDoc so we have data BEFORE initApp runs
+
+  // STEP 1: Synchronous getDoc — sets isAdmin BEFORE initApp runs
   try {
     const snap = await getDoc(ref);
     if (snap.exists()) {
       currentUserData = snap.data();
-      isAdmin = (currentUserData.role === 'admin');
-      adminDataLoaded = true;
+      isAdmin = checkAdminStatus(currentUserData);
       updateBalanceUI(currentUserData.balance || 0);
-      updateProfileUI();
     }
-  } catch(e) { console.warn('Initial getDoc failed', e); }
+  } catch(e) {
+    console.warn('getDoc failed:', e);
+  }
 
-  // Then subscribe for live updates
+  // STEP 2: Live listener for real-time updates (balance changes etc.)
+  if (unsubscribeBalance) unsubscribeBalance();
   unsubscribeBalance = onSnapshot(ref, (snap) => {
     if (snap.exists()) {
-      currentUserData = snap.data();
       const wasAdmin = isAdmin;
-      isAdmin = (currentUserData.role === 'admin');
-      adminDataLoaded = true;
+      currentUserData = snap.data();
+      isAdmin = checkAdminStatus(currentUserData);
       updateBalanceUI(currentUserData.balance || 0);
-      updateProfileUI();
-      // If admin just resolved after page already loaded, refresh nav
+      // Always re-render nav when snapshot fires
+      applyAdminUI();
       if (isAdmin && !wasAdmin) {
-        updateProfileUI();
-        showToast('👑 Admin access granted!', 'success');
+        showToast('👑 Admin access confirmed!', 'success');
       }
     }
   });
+  // loadUserData returns here — isAdmin is already set from getDoc above
 }
 
 function updateBalanceUI(balance) {
@@ -178,11 +185,15 @@ function updateBalanceUI(balance) {
   });
 }
 
-function updateProfileUI() {
-  if (!currentUserData || !currentUser) return;
+// ── CRITICAL FIX: Single function that controls ALL admin UI ──
+function applyAdminUI() {
+  if (!currentUser || !currentUserData) return;
+
   const name = currentUserData.name || currentUser.displayName || currentUser.email;
   const email = currentUser.email;
   const letter = name.charAt(0).toUpperCase();
+
+  // Basic profile fields
   setEl('dash-username', name);
   setEl('sidebar-name', name);
   setEl('profile-name', name);
@@ -193,13 +204,21 @@ function updateProfileUI() {
   setEl('profile-avatar', letter);
   setEl('profile-total-nums', currentUserData.totalNumbers || 0);
   setEl('profile-total-sms', currentUserData.totalSms || 0);
+  setEl('sidebar-role', isAdmin ? '👑 Admin' : 'Member');
 
-  // FIX: Both admin-nav and settings-nav together, never conflict
-  const adminNav = document.getElementById('admin-nav');
-  const settingsNav = document.getElementById('settings-nav');
-  if (adminNav) adminNav.style.display = isAdmin ? 'block' : 'none';
-  if (settingsNav) settingsNav.style.display = isAdmin ? 'flex' : 'none';
+  // ── CRITICAL: Admin nav visibility ──
+  // These elements must be shown/hidden based on isAdmin
+  const adminSection = document.getElementById('admin-nav-section');
+  const adminNavItem = document.getElementById('admin-nav-item');
+  const settingsNavItem = document.getElementById('settings-nav-item');
+
+  if (adminSection) adminSection.style.display = isAdmin ? 'block' : 'none';
+  if (adminNavItem) adminNavItem.style.display = isAdmin ? 'flex' : 'none';
+  if (settingsNavItem) settingsNavItem.style.display = isAdmin ? 'flex' : 'none';
 }
+
+// Keep old name for compatibility
+function updateProfileUI() { applyAdminUI(); }
 
 // ── DURIAN API ──
 function parseProxyResponse(text) {
@@ -402,7 +421,13 @@ async function loadMyRechargeHistory() {
 
 // ── ADMIN PANEL ──
 async function loadAdminPanel() {
-  if (!isAdmin) { showToast('Admins only!', 'error'); navigate('dashboard'); return; }
+  // Double check from currentUserData directly — most reliable
+  const adminOk = currentUserData && currentUserData.role === 'admin';
+  if (!adminOk) {
+    showToast('Access denied. Admins only!', 'error');
+    navigate('dashboard');
+    return;
+  }
   await Promise.all([loadPendingRecharges(), loadAllUsers()]);
 }
 
@@ -437,7 +462,7 @@ async function loadPendingRecharges() {
 }
 
 window.approveRecharge = async function(docId, uid, amount) {
-  if (!isAdmin) return;
+  if (!(currentUserData && currentUserData.role === 'admin')) return;
   if (!confirm(`Approve $${amount}?`)) return;
   try {
     await updateDoc(doc(db, 'rechargeRequests', docId), { status: 'approved', approvedAt: serverTimestamp() });
@@ -448,7 +473,7 @@ window.approveRecharge = async function(docId, uid, amount) {
 };
 
 window.rejectRecharge = async function(docId) {
-  if (!isAdmin) return;
+  if (!(currentUserData && currentUserData.role === 'admin')) return;
   if (!confirm('Reject this request?')) return;
   try {
     await updateDoc(doc(db, 'rechargeRequests', docId), { status: 'rejected', rejectedAt: serverTimestamp() });
@@ -458,7 +483,7 @@ window.rejectRecharge = async function(docId) {
 };
 
 async function loadAllUsers() {
-  if (!isAdmin) return;
+  if (!(currentUserData && currentUserData.role === 'admin')) return;
   try {
     const snap = await getDocs(collection(db, 'users'));
     const tbody = document.getElementById('admin-users-tbody');
@@ -498,7 +523,7 @@ async function loadAllUsers() {
 }
 
 window.addCreditModal = function(uid, name, currentBal) {
-  if (!isAdmin) return;
+  if (!(currentUserData && currentUserData.role === 'admin')) return;
   const amount = parseFloat(prompt(`💰 Add credit to ${name}\nCurrent balance: $${currentBal.toFixed(2)}\n\nEnter USD amount to add:`));
   if (!amount || isNaN(amount) || amount <= 0) return;
   if (!confirm(`Add $${amount} to ${name}?`)) return;
@@ -508,7 +533,7 @@ window.addCreditModal = function(uid, name, currentBal) {
 };
 
 window.deductCreditModal = function(uid, name, currentBal) {
-  if (!isAdmin) return;
+  if (!(currentUserData && currentUserData.role === 'admin')) return;
   const amount = parseFloat(prompt(`➖ Deduct from ${name}\nCurrent balance: $${currentBal.toFixed(2)}\n\nEnter USD amount to deduct:`));
   if (!amount || isNaN(amount) || amount <= 0) return;
   if (amount > currentBal) return showToast('Cannot deduct more than current balance.', 'error');
@@ -519,7 +544,7 @@ window.deductCreditModal = function(uid, name, currentBal) {
 };
 
 window.makeAdmin = async function(uid) {
-  if (!isAdmin) return;
+  if (!(currentUserData && currentUserData.role === 'admin')) return;
   if (!confirm('Make this user an Admin? This gives full access.')) return;
   await updateDoc(doc(db, 'users', uid), { role: 'admin' });
   showToast('User promoted to Admin.', 'success');
@@ -683,98 +708,172 @@ window.clearHistory = function() {
 };
 window.searchHistory = function() { renderHistory(); };
 
-// ── NAVIGATION (FIXED) ──
+// ── NAVIGATION — FIXED & SECURE ──
 window.navigate = function(page) {
-  // FIX: Use both isAdmin flag AND currentUserData.role for timing safety
-  const adminOk = isAdmin || (currentUserData && currentUserData.role === 'admin');
+  // ALWAYS read role directly from Firestore data — most reliable source
+  const userIsAdmin = currentUserData && currentUserData.role === 'admin';
 
-  if ((page === 'admin' || page === 'settings') && !adminOk) {
+  // Block non-admins from admin/settings pages
+  if ((page === 'admin' || page === 'settings') && !userIsAdmin) {
     showToast('Access denied. Admins only.', 'error');
     return;
   }
 
-  // FIX: Sync isAdmin if it was delayed
-  if (adminOk && !isAdmin) {
-    isAdmin = true;
-    updateProfileUI();
-  }
+  // Sync isAdmin flag in case it drifted
+  isAdmin = userIsAdmin;
 
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+
   const el = document.getElementById(`page-${page}`);
   if (el) el.classList.add('active');
+
+  // Highlight correct nav items
   document.querySelectorAll(`.nav-item[data-page="${page}"]`).forEach(n => n.classList.add('active'));
-  const titles = { dashboard:'Dashboard', facebook:'Facebook Numbers', whatsapp:'WhatsApp Numbers', history:'History', recharge:'Recharge (bKash)', help:'Help', settings:'API Settings', profile:'Profile', admin:'Admin Panel' };
-  setEl('header-title', titles[page]||page);
+
+  const titles = {
+    dashboard:'Dashboard', facebook:'Facebook Numbers', whatsapp:'WhatsApp Numbers',
+    history:'History', recharge:'Recharge (bKash)', help:'Help',
+    settings:'API Settings', profile:'Profile', admin:'Admin Panel'
+  };
+  setEl('header-title', titles[page] || page);
   currentPage = page;
   closeSidebar();
+
   if (page==='recharge') loadMyRechargeHistory();
   if (page==='admin') loadAdminPanel();
   if (page==='facebook') renderActiveList('fb');
   if (page==='whatsapp') renderActiveList('wa');
 };
 
-window.toggleSidebar = function() { document.getElementById('sidebar').classList.toggle('open'); document.getElementById('overlay').classList.toggle('show'); };
-window.closeSidebar = function() { document.getElementById('sidebar').classList.remove('open'); document.getElementById('overlay').classList.remove('show'); };
+window.toggleSidebar = function() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('overlay').classList.toggle('show');
+};
+window.closeSidebar = function() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('overlay').classList.remove('show');
+};
 
 // ── AUTH UI ──
-window.showLoginTab = function() { document.getElementById('auth-login').classList.add('active'); document.getElementById('auth-register').classList.remove('active'); document.getElementById('tab-login').classList.add('auth-tab-active'); document.getElementById('tab-register').classList.remove('auth-tab-active'); clearAuthError(); };
-window.showRegisterTab = function() { document.getElementById('auth-register').classList.add('active'); document.getElementById('auth-login').classList.remove('active'); document.getElementById('tab-register').classList.add('auth-tab-active'); document.getElementById('tab-login').classList.remove('auth-tab-active'); clearAuthError(); };
-function showAuth() { document.getElementById('auth-screen').style.display='flex'; document.getElementById('main-panel').style.display='none'; }
-function showPanel() { document.getElementById('auth-screen').style.display='none'; document.getElementById('main-panel').style.display='flex'; }
-function showAuthError(msg) { const el=document.getElementById('auth-error'); if(el){el.textContent=msg;el.style.display='block';} }
-function clearAuthError() { const el=document.getElementById('auth-error'); if(el){el.textContent='';el.style.display='none';} }
-function setAuthLoading(on) { document.querySelectorAll('#auth-screen button[type="button"].btn-primary').forEach(b=>{b.disabled=on;}); }
+window.showLoginTab = function() {
+  document.getElementById('auth-login').classList.add('active');
+  document.getElementById('auth-register').classList.remove('active');
+  document.getElementById('tab-login').classList.add('auth-tab-active');
+  document.getElementById('tab-register').classList.remove('auth-tab-active');
+  clearAuthError();
+};
+window.showRegisterTab = function() {
+  document.getElementById('auth-register').classList.add('active');
+  document.getElementById('auth-login').classList.remove('active');
+  document.getElementById('tab-register').classList.add('auth-tab-active');
+  document.getElementById('tab-login').classList.remove('auth-tab-active');
+  clearAuthError();
+};
+function showAuth() {
+  document.getElementById('auth-screen').style.display = 'flex';
+  document.getElementById('main-panel').style.display = 'none';
+}
+function showPanel() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('main-panel').style.display = 'flex';
+}
+function showAuthError(msg) {
+  const el = document.getElementById('auth-error');
+  if (el) { el.textContent = msg; el.style.display = 'block'; }
+}
+function clearAuthError() {
+  const el = document.getElementById('auth-error');
+  if (el) { el.textContent = ''; el.style.display = 'none'; }
+}
+function setAuthLoading(on) {
+  document.querySelectorAll('#auth-screen button[type="button"].btn-primary').forEach(b => { b.disabled = on; });
+}
 
 // ── MISC ──
-window.copyText = function(text, toast=true) { navigator.clipboard.writeText(text).then(()=>{if(toast)showToast(`Copied: ${text}`,'success');}).catch(()=>{}); };
-window.copyOTP = function(key) { const el=document.getElementById(`otp-${key}`); if(el&&el.textContent&&el.textContent!=='Waiting…') copyText(el.textContent); else showToast('OTP not received yet.','warning'); };
-window.toggleTheme = function() { document.body.classList.toggle('light'); const btn=document.getElementById('theme-btn'); const isLight=document.body.classList.contains('light'); if(btn)btn.textContent=isLight?'☀️':'🌙'; localStorage.setItem('theme',isLight?'light':'dark'); };
-function startClock() { const el=document.getElementById('live-clock'); if(!el)return; const u=()=>{el.textContent=new Date().toLocaleTimeString();}; u(); setInterval(u,1000); }
-function saveState() { localStorage.setItem('sms_history',JSON.stringify(smsHistory)); localStorage.setItem('active_numbers',JSON.stringify(activeNumbers)); }
-function setEl(id,val) { const el=document.getElementById(id); if(el)el.textContent=val; }
-function formatMoney(val) { const n=parseFloat(val); return isNaN(n)?'$0.00':'$'+n.toFixed(2); }
+window.copyText = function(text, toast=true) {
+  navigator.clipboard.writeText(text).then(() => { if (toast) showToast(`Copied: ${text}`, 'success'); }).catch(() => {});
+};
+window.copyOTP = function(key) {
+  const el = document.getElementById(`otp-${key}`);
+  if (el && el.textContent && el.textContent !== 'Waiting…') copyText(el.textContent);
+  else showToast('OTP not received yet.', 'warning');
+};
+window.toggleTheme = function() {
+  document.body.classList.toggle('light');
+  const btn = document.getElementById('theme-btn');
+  const isLight = document.body.classList.contains('light');
+  if (btn) btn.textContent = isLight ? '☀️' : '🌙';
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+};
+function startClock() {
+  const el = document.getElementById('live-clock');
+  if (!el) return;
+  const u = () => { el.textContent = new Date().toLocaleTimeString(); };
+  u(); setInterval(u, 1000);
+}
+function saveState() {
+  localStorage.setItem('sms_history', JSON.stringify(smsHistory));
+  localStorage.setItem('active_numbers', JSON.stringify(activeNumbers));
+}
+function setEl(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function formatMoney(val) { const n = parseFloat(val); return isNaN(n) ? '$0.00' : '$' + n.toFixed(2); }
 
 function showToast(msg, type='info') {
-  const icons={success:'✅',error:'❌',warning:'⚠️',info:'ℹ️'};
-  const container=document.getElementById('toast-container');
-  if(!container)return;
-  const t=document.createElement('div');
-  t.className=`toast ${type}`;
-  t.innerHTML=`<span class="toast-icon">${icons[type]||'ℹ️'}</span><span class="toast-text">${msg}</span>`;
+  const icons = { success:'✅', error:'❌', warning:'⚠️', info:'ℹ️' };
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.innerHTML = `<span class="toast-icon">${icons[type]||'ℹ️'}</span><span class="toast-text">${msg}</span>`;
   container.appendChild(t);
-  setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),300);},4000);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 4000);
 }
 
 window.testApiConnection = async function() {
-  if (!isAdmin) { showToast('Admins only.','error'); return; }
-  const statusEl=document.getElementById('conn-status');
-  if(statusEl){statusEl.style.background='rgba(245,158,11,0.1)';statusEl.style.color='var(--yellow)';statusEl.textContent='● Testing…';}
+  if (!(currentUserData && currentUserData.role === 'admin')) { showToast('Admins only.', 'error'); return; }
+  const statusEl = document.getElementById('conn-status');
+  if (statusEl) { statusEl.style.background = 'rgba(245,158,11,0.1)'; statusEl.style.color = 'var(--yellow)'; statusEl.textContent = '● Testing…'; }
   try {
-    const res=await durianCall('getUserInfo');
-    if(res&&res.code===200){
-      if(statusEl){statusEl.style.background='rgba(16,185,129,0.1)';statusEl.style.color='var(--green)';statusEl.style.borderColor='rgba(16,185,129,0.2)';statusEl.textContent='● Connected ✅';}
-      showToast('✅ DurianRCS Connected! Balance: '+formatMoney(res.data?.money||0),'success');
-    }else{if(statusEl){statusEl.style.color='var(--red)';statusEl.textContent='● Error: '+(res?.msg||'?');}}
+    const res = await durianCall('getUserInfo');
+    if (res && res.code === 200) {
+      if (statusEl) { statusEl.style.background = 'rgba(16,185,129,0.1)'; statusEl.style.color = 'var(--green)'; statusEl.style.borderColor = 'rgba(16,185,129,0.2)'; statusEl.textContent = '● Connected ✅'; }
+      showToast('✅ DurianRCS Connected! Balance: ' + formatMoney(res.data?.money || 0), 'success');
+    } else {
+      if (statusEl) { statusEl.style.color = 'var(--red)'; statusEl.textContent = '● Error: ' + (res?.msg || '?'); }
+    }
   } catch(e) {
-    if(statusEl){statusEl.style.background='rgba(244,63,94,0.1)';statusEl.style.color='var(--red)';statusEl.textContent='● Failed — Deploy to Netlify';}
-    showToast('❌ Connection failed: '+e.message,'error');
+    if (statusEl) { statusEl.style.background = 'rgba(244,63,94,0.1)'; statusEl.style.color = 'var(--red)'; statusEl.textContent = '● Failed — Deploy to Netlify'; }
+    showToast('❌ Connection failed: ' + e.message, 'error');
   }
 };
 
-// FIX: initApp now waits for admin data before navigating
+// ── INIT APP — called AFTER loadUserData completes ──
 function initApp() {
-  if(localStorage.getItem('theme')==='light'){document.body.classList.add('light');const btn=document.getElementById('theme-btn');if(btn)btn.textContent='☀️';}
-  setEl('last-login',new Date().toLocaleString('en-US'));
-  startClock(); updateStats(); renderHistory();
-  activeNumbers.forEach(n=>startOtpPolling(n.phone,n.pid,n.service));
-  // Navigate after profile is updated (isAdmin is already set via getDoc in loadUserData)
+  if (localStorage.getItem('theme') === 'light') {
+    document.body.classList.add('light');
+    const btn = document.getElementById('theme-btn');
+    if (btn) btn.textContent = '☀️';
+  }
+  setEl('last-login', new Date().toLocaleString('en-US'));
+  startClock();
+  updateStats();
+  renderHistory();
+  activeNumbers.forEach(n => startOtpPolling(n.phone, n.pid, n.service));
+
+  // CRITICAL: Apply admin UI BEFORE navigate — isAdmin already set from getDoc
+  applyAdminUI();
+
   navigate('dashboard');
-  setTimeout(()=>showToast(`Welcome, ${currentUser?.displayName||''}! 👋`,'success'),500);
-  setTimeout(async()=>{
-    try{const res=await durianCall('getUserInfo');if(res&&res.code===200)showToast('✅ DurianRCS API Connected!','success');}
-    catch(e){showToast('⚠️ DurianRCS API offline. Deploy to Netlify.','warning');}
-  },1500);
+  setTimeout(() => showToast(`Welcome, ${currentUser?.displayName || ''}! 👋`, 'success'), 500);
+  setTimeout(async () => {
+    try {
+      const res = await durianCall('getUserInfo');
+      if (res && res.code === 200) showToast('✅ DurianRCS API Connected!', 'success');
+    } catch(e) {
+      showToast('⚠️ DurianRCS API offline. Deploy to Netlify.', 'warning');
+    }
+  }, 1500);
 }
 
 window._renderHistory = renderHistory;
@@ -942,6 +1041,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .profile-grid{display:grid;grid-template-columns:320px 1fr;gap:24px}
 .profile-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
 .profile-banner{height:80px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.profile-avatar-wrap{position:relative}
 .profile-avatar{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;color:#fff;border:3px solid var(--bg2);margin:-32px 0 0 20px;position:relative;z-index:1}
 .profile-info{padding:16px 20px 24px}
 .profile-name{font-size:20px;font-weight:800;color:var(--text)}
@@ -984,6 +1084,12 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .refresh-spin{animation:spin 1s linear infinite}
 .divider{height:1px;background:var(--border);margin:16px 0}
 .input-hint{font-size:11px;color:var(--text2);margin-top:5px;line-height:1.5}
+
+/* Admin nav items — hidden by default, shown via JS only for admins */
+#admin-nav-section { display: none; }
+#admin-nav-item   { display: none; }
+#settings-nav-item{ display: none; }
+
 @media(max-width:1100px){.service-grid{grid-template-columns:1fr}.recharge-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}}
 @media(max-width:900px){:root{--sidebar:0px}.sidebar{transform:translateX(-260px);width:260px}.sidebar.open{transform:translateX(0)}.main-wrapper{margin-left:0}.hamburger{display:flex}.clock-pill{display:none}}
 @media(max-width:640px){.content{padding:16px}.stats-grid{grid-template-columns:1fr 1fr}.form-row{flex-direction:column}.action-btns{flex-wrap:wrap}.header{padding:0 16px;gap:10px}.header-search{max-width:130px}.balance-pill .balance-label{display:none}.tbl{font-size:12px}.tbl th,.tbl td{padding:8px 10px}.admin-stats-grid{grid-template-columns:1fr 1fr}.rate-info-grid{grid-template-columns:1fr 1fr}}
@@ -991,6 +1097,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 </head>
 <body>
 
+<!-- AUTH SCREEN -->
 <div id="auth-screen">
   <div class="auth-box">
     <div class="auth-logo">
@@ -1026,364 +1133,392 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   </div>
 </div>
 
+<!-- MAIN PANEL -->
 <div id="main-panel" style="display:none">
-<nav class="sidebar" id="sidebar">
-  <div class="sidebar-logo">
-    <div class="logo-icon">📱</div>
-    <div>
-      <div class="logo-text">Durian<span>SMS</span></div>
-      <div style="font-size:10px;color:var(--text2);margin-top:1px">Premium Panel v3.1</div>
+
+  <!-- SIDEBAR -->
+  <nav class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-icon">📱</div>
+      <div>
+        <div class="logo-text">Durian<span>SMS</span></div>
+        <div style="font-size:10px;color:var(--text2);margin-top:1px">Premium Panel v3.2</div>
+      </div>
     </div>
-  </div>
-  <div class="sidebar-nav">
-    <div class="nav-section-label">Main</div>
-    <a class="nav-item" data-page="dashboard" onclick="navigate('dashboard')" href="#">
-      <span class="nav-icon">🏠</span> Dashboard
-    </a>
-    <a class="nav-item" data-page="facebook" onclick="navigate('facebook')" href="#">
-      <span class="nav-icon">📘</span> Facebook Numbers
-    </a>
-    <a class="nav-item" data-page="whatsapp" onclick="navigate('whatsapp')" href="#">
-      <span class="nav-icon">💬</span> WhatsApp Numbers
-    </a>
-    <div class="nav-section-label">Account</div>
-    <a class="nav-item" data-page="history" onclick="navigate('history')" href="#">
-      <span class="nav-icon">📜</span> History
-      <span class="nav-badge" id="history-badge">0</span>
-    </a>
-    <a class="nav-item" data-page="recharge" onclick="navigate('recharge')" href="#">
-      <span class="nav-icon">💳</span> Recharge (bKash)
-    </a>
-    <a class="nav-item" data-page="profile" onclick="navigate('profile')" href="#">
-      <span class="nav-icon">👤</span> Profile
-    </a>
-    <div id="admin-nav" style="display:none">
-      <div class="nav-section-label">⚠️ Admin Only</div>
-      <a class="nav-item" data-page="admin" onclick="navigate('admin')" href="#">
-        <span class="nav-icon">👑</span> Admin Panel
+
+    <div class="sidebar-nav">
+      <!-- MAIN section -->
+      <div class="nav-section-label">Main</div>
+      <a class="nav-item" data-page="dashboard" onclick="navigate('dashboard')" href="#">
+        <span class="nav-icon">🏠</span> Dashboard
       </a>
-      <a class="nav-item" id="settings-nav" data-page="settings" onclick="navigate('settings')" href="#" style="display:none">
-        <span class="nav-icon">⚙</span> API Settings
+      <a class="nav-item" data-page="facebook" onclick="navigate('facebook')" href="#">
+        <span class="nav-icon">📘</span> Facebook Numbers
+      </a>
+      <a class="nav-item" data-page="whatsapp" onclick="navigate('whatsapp')" href="#">
+        <span class="nav-icon">💬</span> WhatsApp Numbers
+      </a>
+
+      <!-- ACCOUNT section -->
+      <div class="nav-section-label">Account</div>
+      <a class="nav-item" data-page="history" onclick="navigate('history')" href="#">
+        <span class="nav-icon">📜</span> History
+        <span class="nav-badge" id="history-badge">0</span>
+      </a>
+      <a class="nav-item" data-page="recharge" onclick="navigate('recharge')" href="#">
+        <span class="nav-icon">💳</span> Recharge (bKash)
+      </a>
+      <a class="nav-item" data-page="profile" onclick="navigate('profile')" href="#">
+        <span class="nav-icon">👤</span> Profile
+      </a>
+
+      <!-- ADMIN ONLY section — hidden via CSS, shown by applyAdminUI() -->
+      <div id="admin-nav-section">
+        <div class="nav-section-label" style="color:var(--yellow);opacity:1">⚠️ Admin Only</div>
+        <a class="nav-item" id="admin-nav-item" data-page="admin" onclick="navigate('admin')" href="#">
+          <span class="nav-icon">👑</span> Admin Panel
+        </a>
+        <a class="nav-item" id="settings-nav-item" data-page="settings" onclick="navigate('settings')" href="#">
+          <span class="nav-icon">⚙</span> API Settings
+        </a>
+      </div>
+
+      <!-- Logout always visible -->
+      <div class="nav-section-label">Session</div>
+      <a class="nav-item" onclick="handleLogout()" href="#">
+        <span class="nav-icon">🚪</span> Logout
       </a>
     </div>
-    <div class="nav-section-label">Account</div>
-    <a class="nav-item" onclick="handleLogout()" href="#">
-      <span class="nav-icon">🚪</span> Logout
-    </a>
-  </div>
-  <div class="sidebar-footer">
-    <div class="user-chip" onclick="navigate('profile')">
-      <div class="avatar" id="sidebar-avatar">?</div>
-      <div class="user-info">
-        <div class="user-name" id="sidebar-name">Loading…</div>
-        <div class="user-role" id="sidebar-role">Member</div>
-      </div>
-      <span style="color:var(--text2);font-size:12px">›</span>
-    </div>
-  </div>
-</nav>
 
-<div class="overlay" id="overlay" onclick="closeSidebar()"></div>
-
-<div class="main-wrapper">
-  <header class="header">
-    <div class="hamburger" id="hamburger" onclick="toggleSidebar()">☰</div>
-    <div class="header-title" id="header-title">Dashboard</div>
-    <div class="header-search">
-      <span class="search-icon">🔍</span>
-      <input type="text" placeholder="Search number, OTP…" id="search-input" oninput="searchHistory()">
-    </div>
-    <div class="header-right">
-      <div class="balance-pill">
-        <span class="balance-label">Balance</span>
-        <span class="balance-value" id="header-balance">$0.00</span>
-      </div>
-      <button class="btn-recharge" onclick="navigate('recharge')">+ Recharge</button>
-      <div class="clock-pill" id="live-clock">00:00:00</div>
-      <div class="icon-btn" onclick="toggleTheme()" title="Toggle theme" id="theme-btn">🌙</div>
-    </div>
-  </header>
-
-  <div class="content">
-
-    <!-- DASHBOARD -->
-    <div class="page" id="page-dashboard">
-      <div class="page-header">
-        <div class="page-title">Welcome, <span id="dash-username" style="color:var(--accent)">…</span> 👋</div>
-        <div class="page-sub">Manage your activation numbers from here.</div>
-      </div>
-      <div class="stats-grid">
-        <div class="stat-card green"><div class="stat-icon">💰</div><div class="stat-val" id="stat-balance">$0.00</div><div class="stat-label">Account Balance</div><div class="stat-change up">● Live</div></div>
-        <div class="stat-card blue"><div class="stat-icon">📱</div><div class="stat-val" id="stat-active">0</div><div class="stat-label">Active Numbers</div></div>
-        <div class="stat-card yellow"><div class="stat-icon">📨</div><div class="stat-val" id="stat-sms">0</div><div class="stat-label">SMS Received</div></div>
-        <div class="stat-card purple"><div class="stat-icon">⏳</div><div class="stat-val" id="stat-waiting">0</div><div class="stat-label">Awaiting SMS</div></div>
-        <div class="stat-card cyan"><div class="stat-icon">🇺🇸</div><div class="stat-val" id="stat-usa">0</div><div class="stat-label">USA Numbers</div></div>
-        <div class="stat-card red"><div class="stat-icon">🇨🇦</div><div class="stat-val" id="stat-ca">0</div><div class="stat-label">Canada Numbers</div></div>
-      </div>
-      <div style="margin-bottom:16px" class="cost-badge">💰 Each number costs $0.17 — deducted automatically</div>
-      <div class="service-grid">
-        <div class="service-card">
-          <div class="service-header"><div class="service-logo fb">📘</div><div><div class="service-name">Facebook Activation</div><div class="service-desc">USA & Canada OTP numbers</div></div></div>
-          <div class="form-row">
-            <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="dash-fb-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
-            <div class="form-group"><label class="form-label">Qty (1–10)</label><input type="number" class="form-input" id="dash-fb-qty" value="1" min="1" max="10"></div>
-          </div>
-          <button class="btn-primary fb-btn" onclick="getNumber('fb','dash')" id="dash-fb-btn">📘 Get Facebook Number</button>
-          <div class="result-box" id="dash-fb-result"></div>
+    <div class="sidebar-footer">
+      <div class="user-chip" onclick="navigate('profile')">
+        <div class="avatar" id="sidebar-avatar">?</div>
+        <div class="user-info">
+          <div class="user-name" id="sidebar-name">Loading…</div>
+          <div class="user-role" id="sidebar-role">Member</div>
         </div>
-        <div class="service-card">
-          <div class="service-header"><div class="service-logo wa">💬</div><div><div class="service-name">WhatsApp Activation</div><div class="service-desc">USA & Canada OTP numbers</div></div></div>
-          <div class="form-row">
-            <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="dash-wa-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
-            <div class="form-group"><label class="form-label">Qty (1–10)</label><input type="number" class="form-input" id="dash-wa-qty" value="1" min="1" max="10"></div>
+        <span style="color:var(--text2);font-size:12px">›</span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="overlay" id="overlay" onclick="closeSidebar()"></div>
+
+  <div class="main-wrapper">
+    <header class="header">
+      <div class="hamburger" id="hamburger" onclick="toggleSidebar()">☰</div>
+      <div class="header-title" id="header-title">Dashboard</div>
+      <div class="header-search">
+        <span class="search-icon">🔍</span>
+        <input type="text" placeholder="Search number, OTP…" id="search-input" oninput="searchHistory()">
+      </div>
+      <div class="header-right">
+        <div class="balance-pill">
+          <span class="balance-label">Balance</span>
+          <span class="balance-value" id="header-balance">$0.00</span>
+        </div>
+        <button class="btn-recharge" onclick="navigate('recharge')">+ Recharge</button>
+        <div class="clock-pill" id="live-clock">00:00:00</div>
+        <div class="icon-btn" onclick="toggleTheme()" title="Toggle theme" id="theme-btn">🌙</div>
+      </div>
+    </header>
+
+    <div class="content">
+
+      <!-- DASHBOARD PAGE -->
+      <div class="page" id="page-dashboard">
+        <div class="page-header">
+          <div class="page-title">Welcome, <span id="dash-username" style="color:var(--accent)">…</span> 👋</div>
+          <div class="page-sub">Manage your activation numbers from here.</div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card green"><div class="stat-icon">💰</div><div class="stat-val" id="stat-balance">$0.00</div><div class="stat-label">Account Balance</div><div class="stat-change up">● Live</div></div>
+          <div class="stat-card blue"><div class="stat-icon">📱</div><div class="stat-val" id="stat-active">0</div><div class="stat-label">Active Numbers</div></div>
+          <div class="stat-card yellow"><div class="stat-icon">📨</div><div class="stat-val" id="stat-sms">0</div><div class="stat-label">SMS Received</div></div>
+          <div class="stat-card purple"><div class="stat-icon">⏳</div><div class="stat-val" id="stat-waiting">0</div><div class="stat-label">Awaiting SMS</div></div>
+          <div class="stat-card cyan"><div class="stat-icon">🇺🇸</div><div class="stat-val" id="stat-usa">0</div><div class="stat-label">USA Numbers</div></div>
+          <div class="stat-card red"><div class="stat-icon">🇨🇦</div><div class="stat-val" id="stat-ca">0</div><div class="stat-label">Canada Numbers</div></div>
+        </div>
+        <div style="margin-bottom:16px" class="cost-badge">💰 Each number costs $0.17 — deducted automatically</div>
+        <div class="service-grid">
+          <div class="service-card">
+            <div class="service-header">
+              <div class="service-logo fb">📘</div>
+              <div><div class="service-name">Facebook Activation</div><div class="service-desc">USA & Canada OTP numbers</div></div>
+            </div>
+            <div class="form-row">
+              <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="dash-fb-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
+              <div class="form-group"><label class="form-label">Qty (1–10)</label><input type="number" class="form-input" id="dash-fb-qty" value="1" min="1" max="10"></div>
+            </div>
+            <button class="btn-primary fb-btn" onclick="getNumber('fb','dash')" id="dash-fb-btn">📘 Get Facebook Number</button>
+            <div class="result-box" id="dash-fb-result"></div>
           </div>
-          <button class="btn-primary wa-btn" onclick="getNumber('wa','dash')" id="dash-wa-btn">💬 Get WhatsApp Number</button>
-          <div class="result-box" id="dash-wa-result"></div>
+          <div class="service-card">
+            <div class="service-header">
+              <div class="service-logo wa">💬</div>
+              <div><div class="service-name">WhatsApp Activation</div><div class="service-desc">USA & Canada OTP numbers</div></div>
+            </div>
+            <div class="form-row">
+              <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="dash-wa-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
+              <div class="form-group"><label class="form-label">Qty (1–10)</label><input type="number" class="form-input" id="dash-wa-qty" value="1" min="1" max="10"></div>
+            </div>
+            <button class="btn-primary wa-btn" onclick="getNumber('wa','dash')" id="dash-wa-btn">💬 Get WhatsApp Number</button>
+            <div class="result-box" id="dash-wa-result"></div>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <div class="table-header">
+            <div class="table-title">📋 Recent Activity</div>
+            <button class="btn-outline" onclick="navigate('history')">View All →</button>
+          </div>
+          <div style="overflow-x:auto"><table class="tbl">
+            <thead><tr><th>Platform</th><th>Country</th><th>Phone</th><th>OTP</th><th>Status</th><th>Time</th><th>Copy</th><th>Release</th></tr></thead>
+            <tbody id="recent-tbody"><tr class="empty-row"><td colspan="8">No activity yet. Get your first number! 🚀</td></tr></tbody>
+          </table></div>
         </div>
       </div>
-      <div class="table-wrap">
-        <div class="table-header"><div class="table-title">📋 Recent Activity</div><button class="btn-outline" onclick="navigate('history')">View All →</button></div>
-        <div style="overflow-x:auto"><table class="tbl">
+
+      <!-- FACEBOOK PAGE -->
+      <div class="page" id="page-facebook">
+        <div class="page-header"><div class="page-title">📘 Facebook Numbers</div><div class="page-sub">Get USA & Canada numbers for Facebook OTP</div></div>
+        <div class="service-grid">
+          <div class="service-card" style="border-color:rgba(24,119,242,0.25)">
+            <div class="service-header"><div class="service-logo fb" style="width:56px;height:56px;font-size:28px">📘</div><div><div class="service-name">Get Facebook Number</div><div class="service-desc">USA & Canada available</div></div></div>
+            <div class="form-row">
+              <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="fb-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
+              <div class="form-group"><label class="form-label">Quantity (1–10)</label><input type="number" class="form-input" id="fb-qty" value="1" min="1" max="10"></div>
+            </div>
+            <div class="cost-badge">💰 $0.17 × quantity = total cost</div>
+            <button class="btn-primary fb-btn" onclick="getNumber('fb','page')" id="fb-page-btn">📘 Get Facebook Number</button>
+            <div class="result-box" id="fb-page-result"></div>
+          </div>
+          <div class="service-card" style="border-color:rgba(24,119,242,0.15)">
+            <div class="service-header">
+              <div style="flex:1"><div class="service-name">Active Facebook Numbers</div><div class="service-desc">Real-time OTP monitoring</div></div>
+              <div class="auto-badge"><span class="pulse"></span>Auto-refresh ON</div>
+            </div>
+            <div id="fb-active-list"><div style="text-align:center;color:var(--text2);padding:40px;font-size:14px">No active numbers.</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- WHATSAPP PAGE -->
+      <div class="page" id="page-whatsapp">
+        <div class="page-header"><div class="page-title">💬 WhatsApp Numbers</div><div class="page-sub">Get USA & Canada numbers for WhatsApp OTP</div></div>
+        <div class="service-grid">
+          <div class="service-card" style="border-color:rgba(37,211,102,0.25)">
+            <div class="service-header"><div class="service-logo wa" style="width:56px;height:56px;font-size:28px">💬</div><div><div class="service-name">Get WhatsApp Number</div><div class="service-desc">USA & Canada available</div></div></div>
+            <div class="form-row">
+              <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="wa-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
+              <div class="form-group"><label class="form-label">Quantity (1–10)</label><input type="number" class="form-input" id="wa-qty" value="1" min="1" max="10"></div>
+            </div>
+            <div class="cost-badge">💰 $0.17 × quantity = total cost</div>
+            <button class="btn-primary wa-btn" onclick="getNumber('wa','page')" id="wa-page-btn">💬 Get WhatsApp Number</button>
+            <div class="result-box" id="wa-page-result"></div>
+          </div>
+          <div class="service-card" style="border-color:rgba(37,211,102,0.15)">
+            <div class="service-header">
+              <div style="flex:1"><div class="service-name">Active WhatsApp Numbers</div><div class="service-desc">Real-time OTP monitoring</div></div>
+              <div class="auto-badge"><span class="pulse"></span>Auto-refresh ON</div>
+            </div>
+            <div id="wa-active-list"><div style="text-align:center;color:var(--text2);padding:40px;font-size:14px">No active numbers.</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HISTORY PAGE -->
+      <div class="page" id="page-history">
+        <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+          <div><div class="page-title">📜 History</div><div class="page-sub">All activation sessions</div></div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <select class="form-select" id="hist-filter-platform" onchange="renderHistory()" style="width:160px"><option value="">All Platforms</option><option value="Facebook">Facebook</option><option value="WhatsApp">WhatsApp</option></select>
+            <select class="form-select" id="hist-filter-country" onchange="renderHistory()" style="width:150px"><option value="">All Countries</option><option value="USA">USA</option><option value="Canada">Canada</option></select>
+            <button class="btn-outline" onclick="clearHistory()" style="color:var(--red);border-color:rgba(244,63,94,0.3)">🗑 Clear</button>
+          </div>
+        </div>
+        <div class="table-wrap"><div style="overflow-x:auto"><table class="tbl">
           <thead><tr><th>Platform</th><th>Country</th><th>Phone</th><th>OTP</th><th>Status</th><th>Time</th><th>Copy</th><th>Release</th></tr></thead>
-          <tbody id="recent-tbody"><tr class="empty-row"><td colspan="8">No activity yet. Get your first number! 🚀</td></tr></tbody>
-        </table></div>
+          <tbody id="history-tbody"><tr class="empty-row"><td colspan="8">No history found.</td></tr></tbody>
+        </table></div></div>
       </div>
-    </div>
 
-    <!-- FACEBOOK -->
-    <div class="page" id="page-facebook">
-      <div class="page-header"><div class="page-title">📘 Facebook Numbers</div><div class="page-sub">Get USA & Canada numbers for Facebook OTP</div></div>
-      <div class="service-grid">
-        <div class="service-card" style="border-color:rgba(24,119,242,0.25)">
-          <div class="service-header"><div class="service-logo fb" style="width:56px;height:56px;font-size:28px">📘</div><div><div class="service-name">Get Facebook Number</div><div class="service-desc">USA & Canada available</div></div></div>
-          <div class="form-row">
-            <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="fb-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
-            <div class="form-group"><label class="form-label">Quantity (1–10)</label><input type="number" class="form-input" id="fb-qty" value="1" min="1" max="10"></div>
-          </div>
-          <div class="cost-badge">💰 $0.17 × quantity = total cost</div>
-          <button class="btn-primary fb-btn" onclick="getNumber('fb','page')" id="fb-page-btn">📘 Get Facebook Number</button>
-          <div class="result-box" id="fb-page-result"></div>
-        </div>
-        <div class="service-card" style="border-color:rgba(24,119,242,0.15)">
-          <div class="service-header"><div style="flex:1"><div class="service-name">Active Facebook Numbers</div><div class="service-desc">Real-time OTP monitoring</div></div><div class="auto-badge"><span class="pulse"></span>Auto-refresh ON</div></div>
-          <div id="fb-active-list"><div style="text-align:center;color:var(--text2);padding:40px;font-size:14px">No active numbers.</div></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- WHATSAPP -->
-    <div class="page" id="page-whatsapp">
-      <div class="page-header"><div class="page-title">💬 WhatsApp Numbers</div><div class="page-sub">Get USA & Canada numbers for WhatsApp OTP</div></div>
-      <div class="service-grid">
-        <div class="service-card" style="border-color:rgba(37,211,102,0.25)">
-          <div class="service-header"><div class="service-logo wa" style="width:56px;height:56px;font-size:28px">💬</div><div><div class="service-name">Get WhatsApp Number</div><div class="service-desc">USA & Canada available</div></div></div>
-          <div class="form-row">
-            <div class="form-group"><label class="form-label">Country</label><select class="form-select" id="wa-country"><option value="1">🇺🇸 United States</option><option value="2">🇨🇦 Canada</option></select></div>
-            <div class="form-group"><label class="form-label">Quantity (1–10)</label><input type="number" class="form-input" id="wa-qty" value="1" min="1" max="10"></div>
-          </div>
-          <div class="cost-badge">💰 $0.17 × quantity = total cost</div>
-          <button class="btn-primary wa-btn" onclick="getNumber('wa','page')" id="wa-page-btn">💬 Get WhatsApp Number</button>
-          <div class="result-box" id="wa-page-result"></div>
-        </div>
-        <div class="service-card" style="border-color:rgba(37,211,102,0.15)">
-          <div class="service-header"><div style="flex:1"><div class="service-name">Active WhatsApp Numbers</div><div class="service-desc">Real-time OTP monitoring</div></div><div class="auto-badge"><span class="pulse"></span>Auto-refresh ON</div></div>
-          <div id="wa-active-list"><div style="text-align:center;color:var(--text2);padding:40px;font-size:14px">No active numbers.</div></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- HISTORY -->
-    <div class="page" id="page-history">
-      <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
-        <div><div class="page-title">📜 History</div><div class="page-sub">All activation sessions</div></div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <select class="form-select" id="hist-filter-platform" onchange="renderHistory()" style="width:160px"><option value="">All Platforms</option><option value="Facebook">Facebook</option><option value="WhatsApp">WhatsApp</option></select>
-          <select class="form-select" id="hist-filter-country" onchange="renderHistory()" style="width:150px"><option value="">All Countries</option><option value="USA">USA</option><option value="Canada">Canada</option></select>
-          <button class="btn-outline" onclick="clearHistory()" style="color:var(--red);border-color:rgba(244,63,94,0.3)">🗑 Clear</button>
-        </div>
-      </div>
-      <div class="table-wrap"><div style="overflow-x:auto"><table class="tbl">
-        <thead><tr><th>Platform</th><th>Country</th><th>Phone</th><th>OTP</th><th>Status</th><th>Time</th><th>Copy</th><th>Release</th></tr></thead>
-        <tbody id="history-tbody"><tr class="empty-row"><td colspan="8">No history found.</td></tr></tbody>
-      </table></div></div>
-    </div>
-
-    <!-- RECHARGE -->
-    <div class="page" id="page-recharge">
-      <div class="page-header"><div class="page-title">💳 Balance Recharge</div><div class="page-sub">Add balance via bKash — processed by admin within 1–6 hours</div></div>
-      <div class="recharge-grid">
-        <div>
-          <div class="card" style="margin-bottom:20px">
-            <div class="balance-hero">
-              <div class="balance-hero-val" id="recharge-balance">$0.00</div>
-              <div class="balance-hero-label">Your current balance</div>
+      <!-- RECHARGE PAGE -->
+      <div class="page" id="page-recharge">
+        <div class="page-header"><div class="page-title">💳 Balance Recharge</div><div class="page-sub">Add balance via bKash — processed by admin within 1–6 hours</div></div>
+        <div class="recharge-grid">
+          <div>
+            <div class="card" style="margin-bottom:20px">
+              <div class="balance-hero">
+                <div class="balance-hero-val" id="recharge-balance">$0.00</div>
+                <div class="balance-hero-label">Your current balance</div>
+              </div>
+              <div class="cost-badge" style="margin-bottom:0">💰 Each number costs $0.17</div>
             </div>
-            <div class="cost-badge" style="margin-bottom:0">💰 Each number costs $0.17</div>
-          </div>
-          <div class="card" style="margin-bottom:20px">
-            <div class="card-title">📊 Exchange Rate & Limits</div>
-            <div class="rate-info-grid">
-              <div class="rate-chip"><div class="rate-chip-val">130 ৳</div><div class="rate-chip-label">Per 1 USD</div></div>
-              <div class="rate-chip"><div class="rate-chip-val">2.50 ৳</div><div class="rate-chip-label">Fee per ৳100</div></div>
-              <div class="rate-chip"><div class="rate-chip-val">$5 min</div><div class="rate-chip-label">Minimum Recharge</div></div>
-              <div class="rate-chip"><div class="rate-chip-val">$50 max</div><div class="rate-chip-label">Maximum Recharge</div></div>
+            <div class="card" style="margin-bottom:20px">
+              <div class="card-title">📊 Exchange Rate & Limits</div>
+              <div class="rate-info-grid">
+                <div class="rate-chip"><div class="rate-chip-val">130 ৳</div><div class="rate-chip-label">Per 1 USD</div></div>
+                <div class="rate-chip"><div class="rate-chip-val">2.50 ৳</div><div class="rate-chip-label">Fee per ৳100</div></div>
+                <div class="rate-chip"><div class="rate-chip-val">$5 min</div><div class="rate-chip-label">Minimum Recharge</div></div>
+                <div class="rate-chip"><div class="rate-chip-val">$50 max</div><div class="rate-chip-label">Maximum Recharge</div></div>
+              </div>
+              <div style="background:var(--surface);border-radius:var(--radius3);padding:12px 14px;font-size:12px;color:var(--text2);line-height:1.7;margin-top:4px">
+                ⚠️ <strong style="color:var(--text)">Network fee:</strong> ৳2.50 charged per every ৳100 sent.<br>
+                Example: $10 = ৳1300 base + ৳32.50 fee = <strong style="color:var(--accent)">৳1332.50 total</strong>
+              </div>
             </div>
-            <div style="background:var(--surface);border-radius:var(--radius3);padding:12px 14px;font-size:12px;color:var(--text2);line-height:1.7;margin-top:4px">
-              ⚠️ <strong style="color:var(--text)">Network fee:</strong> ৳2.50 charged per every ৳100 sent.<br>
-              Example: $10 = ৳1300 base + ৳32.50 fee = <strong style="color:var(--accent)">৳1332.50 total</strong>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-title">📱 bKash Payment</div>
-            <div class="bkash-box">
-              <div class="bkash-title">💗 Send Money to</div>
-              <div class="bkash-number">01610257165</div>
-              <div class="bkash-note">
-                ⚠️ Use <strong>Send Money</strong> only (not Merchant/Payment).<br>
-                After sending, submit the TrxID below to get your balance added.
+            <div class="card">
+              <div class="card-title">📱 bKash Payment</div>
+              <div class="bkash-box">
+                <div class="bkash-title">💗 Send Money to</div>
+                <div class="bkash-number">01610257165</div>
+                <div class="bkash-note">
+                  ⚠️ Use <strong>Send Money</strong> only (not Merchant/Payment).<br>
+                  After sending, submit the TrxID below to get your balance added.
+                </div>
               </div>
             </div>
           </div>
-        </div>
-        <div>
-          <div class="card" style="margin-bottom:20px">
-            <div class="card-title">🧮 Amount Calculator & Submit</div>
-            <label class="form-label">Enter USD Amount ($5 – $50)</label>
-            <input type="number" class="form-input" id="bkash-amount-usd" placeholder="e.g. 10" min="5" max="50" step="1" oninput="calcRecharge()" style="margin-bottom:6px">
-            <div class="input-hint">Enter the USD amount you want to add. We'll calculate the exact BDT to send.</div>
-            <div class="calc-result" id="calc-result">
-              <div class="calc-row"><span class="calc-label">Base Amount</span><span class="calc-val"><span id="calc-base">—</span> ৳</span></div>
-              <div class="calc-row"><span class="calc-label">Network Fee</span><span class="calc-val" style="color:var(--yellow)">+ <span id="calc-fee">—</span> ৳</span></div>
-              <div class="calc-row"><span class="calc-label">Total to Send via bKash</span><span class="calc-total-val"><span id="calc-total">—</span> ৳</span></div>
-              <div style="text-align:center;margin-top:10px;font-size:12px;color:var(--green);font-weight:600">✅ You will receive: $<span id="calc-usd">—</span> USD credited to your balance</div>
+          <div>
+            <div class="card" style="margin-bottom:20px">
+              <div class="card-title">🧮 Amount Calculator & Submit</div>
+              <label class="form-label">Enter USD Amount ($5 – $50)</label>
+              <input type="number" class="form-input" id="bkash-amount-usd" placeholder="e.g. 10" min="5" max="50" step="1" oninput="calcRecharge()" style="margin-bottom:6px">
+              <div class="input-hint">Enter the USD amount you want to add. We'll calculate the exact BDT to send.</div>
+              <div class="calc-result" id="calc-result">
+                <div class="calc-row"><span class="calc-label">Base Amount</span><span class="calc-val"><span id="calc-base">—</span> ৳</span></div>
+                <div class="calc-row"><span class="calc-label">Network Fee</span><span class="calc-val" style="color:var(--yellow)">+ <span id="calc-fee">—</span> ৳</span></div>
+                <div class="calc-row"><span class="calc-label">Total to Send via bKash</span><span class="calc-total-val"><span id="calc-total">—</span> ৳</span></div>
+                <div style="text-align:center;margin-top:10px;font-size:12px;color:var(--green);font-weight:600">✅ You will receive: $<span id="calc-usd">—</span> USD credited to your balance</div>
+              </div>
+              <div class="divider"></div>
+              <label class="form-label" style="margin-top:4px">bKash Transaction ID (TrxID)</label>
+              <input type="text" class="form-input" id="bkash-txnid" placeholder="e.g. 8C5GH2XVYA" style="margin-bottom:12px">
+              <label class="form-label">Your bKash Number (sender)</label>
+              <input type="text" class="form-input" id="bkash-phone" placeholder="01XXXXXXXXXX" style="margin-bottom:16px">
+              <button class="btn-primary" id="bkash-btn" type="button" onclick="submitRecharge()" disabled>✅ Submit Recharge Request</button>
+              <div class="input-hint" style="margin-top:10px">⚠️ The same TrxID cannot be used twice. Admin approves within 1–6 hours.</div>
             </div>
-            <div class="divider"></div>
-            <label class="form-label" style="margin-top:4px">bKash Transaction ID (TrxID)</label>
-            <input type="text" class="form-input" id="bkash-txnid" placeholder="e.g. 8C5GH2XVYA" style="margin-bottom:12px">
-            <label class="form-label">Your bKash Number (sender)</label>
-            <input type="text" class="form-input" id="bkash-phone" placeholder="01XXXXXXXXXX" style="margin-bottom:16px">
-            <button class="btn-primary" id="bkash-btn" type="button" onclick="submitRecharge()" disabled>✅ Submit Recharge Request</button>
-            <div class="input-hint" style="margin-top:10px">⚠️ The same TrxID cannot be used twice. Admin approves within 1–6 hours.</div>
-          </div>
-          <div class="card">
-            <div class="card-title">📋 My Recharge History</div>
-            <div style="overflow-x:auto"><table class="tbl">
-              <thead><tr><th>Date</th><th>USD</th><th>BDT Breakdown</th><th>Total BDT</th><th>TrxID</th><th>Status</th></tr></thead>
-              <tbody id="deposit-tbody"><tr class="empty-row"><td colspan="6">No history yet.</td></tr></tbody>
-            </table></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ADMIN PANEL -->
-    <div class="page" id="page-admin">
-      <div class="page-header"><div class="page-title">👑 Admin Panel</div><div class="page-sub">Monitor accounts and manage recharge requests</div></div>
-      <div class="admin-warning">⚠️ This section is visible to admins only. All actions are logged.</div>
-      <div class="admin-stats-grid" style="margin-bottom:24px">
-        <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-users">—</div><div class="admin-stat-label">Total Users</div></div>
-        <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-balance">—</div><div class="admin-stat-label">Total Balances</div></div>
-        <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-nums">—</div><div class="admin-stat-label">Numbers Purchased</div></div>
-        <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-sms">—</div><div class="admin-stat-label">SMS Received</div></div>
-      </div>
-      <div class="card" style="margin-bottom:24px">
-        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
-          <span>💳 Recharge Requests</span>
-          <button class="btn-outline" onclick="loadPendingRecharges()">🔄 Refresh</button>
-        </div>
-        <div style="overflow-x:auto"><table class="tbl">
-          <thead><tr><th>Date</th><th>Name</th><th>Email</th><th>USD</th><th>BDT+Fee</th><th>Total BDT</th><th>TrxID</th><th>bKash</th><th>Status</th><th>Action</th></tr></thead>
-          <tbody id="admin-recharge-tbody"><tr class="empty-row"><td colspan="10">Loading…</td></tr></tbody>
-        </table></div>
-      </div>
-      <div class="card">
-        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
-          <span>👥 All Users</span>
-          <button class="btn-outline" onclick="loadAllUsers()">🔄 Refresh</button>
-        </div>
-        <div style="overflow-x:auto"><table class="tbl">
-          <thead><tr><th>Name</th><th>Email</th><th>Balance</th><th>Numbers</th><th>SMS</th><th>Last Login</th><th>Joined</th><th>Role</th><th>Actions</th></tr></thead>
-          <tbody id="admin-users-tbody"><tr class="empty-row"><td colspan="9">Loading…</td></tr></tbody>
-        </table></div>
-      </div>
-    </div>
-
-    <!-- API SETTINGS -->
-    <div class="page" id="page-settings">
-      <div class="page-header"><div class="page-title">⚙ API Settings</div><div class="page-sub">Admin-only — API configuration and connection</div></div>
-      <div class="admin-warning">🔒 This page is restricted to admins. API credentials are never shown to regular users.</div>
-      <div class="settings-card">
-        <div class="setting-row">
-          <div class="setting-label">DurianRCS API Status</div>
-          <div class="status-indicator" id="conn-status">● Checking…</div>
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">API Endpoint</div>
-          <input type="text" class="form-input" value="https://api.durianrcs.com/out/ext_api/" readonly style="opacity:0.7">
-          <div class="setting-sub">API credentials are securely stored server-side. Regular users never have access.</div>
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">Auto-refresh OTP Interval</div>
-          <select class="form-select" id="refresh-interval" style="max-width:220px">
-            <option value="5000">Every 5 seconds</option>
-            <option value="10000" selected>Every 10 seconds</option>
-            <option value="15000">Every 15 seconds</option>
-            <option value="30000">Every 30 seconds</option>
-          </select>
-        </div>
-        <button class="btn-save" onclick="testApiConnection()">🔌 Test API Connection</button>
-      </div>
-    </div>
-
-    <!-- PROFILE -->
-    <div class="page" id="page-profile">
-      <div class="page-header"><div class="page-title">👤 Profile</div><div class="page-sub">Your account overview</div></div>
-      <div class="profile-grid">
-        <div class="profile-card">
-          <div class="profile-banner"></div>
-          <div style="position:relative"><div class="profile-avatar" id="profile-avatar">?</div></div>
-          <div class="profile-info">
-            <div class="profile-name" id="profile-name">Loading…</div>
-            <div class="profile-handle" id="profile-handle">@…</div>
-            <div class="profile-stats">
-              <div class="profile-stat"><div class="profile-stat-val" id="profile-total-nums">0</div><div class="profile-stat-label">Numbers</div></div>
-              <div class="profile-stat"><div class="profile-stat-val" id="profile-total-sms">0</div><div class="profile-stat-label">SMS Rcvd</div></div>
+            <div class="card">
+              <div class="card-title">📋 My Recharge History</div>
+              <div style="overflow-x:auto"><table class="tbl">
+                <thead><tr><th>Date</th><th>USD</th><th>BDT Breakdown</th><th>Total BDT</th><th>TrxID</th><th>Status</th></tr></thead>
+                <tbody id="deposit-tbody"><tr class="empty-row"><td colspan="6">No history yet.</td></tr></tbody>
+              </table></div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- ADMIN PANEL PAGE -->
+      <div class="page" id="page-admin">
+        <div class="page-header"><div class="page-title">👑 Admin Panel</div><div class="page-sub">Monitor accounts and manage recharge requests</div></div>
+        <div class="admin-warning">⚠️ This section is visible to admins only. All actions are logged.</div>
+        <div class="admin-stats-grid">
+          <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-users">—</div><div class="admin-stat-label">Total Users</div></div>
+          <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-balance">—</div><div class="admin-stat-label">Total Balances</div></div>
+          <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-nums">—</div><div class="admin-stat-label">Numbers Purchased</div></div>
+          <div class="admin-stat-card"><div class="admin-stat-val" id="admin-total-sms">—</div><div class="admin-stat-label">SMS Received</div></div>
+        </div>
+        <div class="card" style="margin-bottom:24px">
+          <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+            <span>💳 Recharge Requests</span>
+            <button class="btn-outline" onclick="loadPendingRecharges()">🔄 Refresh</button>
+          </div>
+          <div style="overflow-x:auto"><table class="tbl">
+            <thead><tr><th>Date</th><th>Name</th><th>Email</th><th>USD</th><th>BDT+Fee</th><th>Total BDT</th><th>TrxID</th><th>bKash</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody id="admin-recharge-tbody"><tr class="empty-row"><td colspan="10">Loading…</td></tr></tbody>
+          </table></div>
         </div>
         <div class="card">
-          <div class="card-title">Account Details</div>
-          <div class="detail-list">
-            <div class="detail-item"><span class="detail-key">Name</span><span class="detail-val" id="profile-detail-user">—</span></div>
-            <div class="detail-item"><span class="detail-key">Email</span><span class="detail-val" id="profile-detail-email">—</span></div>
-            <div class="detail-item"><span class="detail-key">Balance</span><span class="detail-val" style="color:var(--green)" id="profile-balance">$0.00</span></div>
-            <div class="detail-item"><span class="detail-key">Last Login</span><span class="detail-val" id="last-login">—</span></div>
-            <div class="detail-item"><span class="detail-key">Cost Per Number</span><span class="detail-val" style="color:var(--yellow)">$0.17</span></div>
-            <div class="detail-item"><span class="detail-key">Exchange Rate</span><span class="detail-val" style="color:var(--accent)">1 USD = 130 ৳</span></div>
+          <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+            <span>👥 All Users</span>
+            <button class="btn-outline" onclick="loadAllUsers()">🔄 Refresh</button>
           </div>
-          <div style="margin-top:20px;display:flex;gap:10px">
-            <button class="btn-outline" onclick="navigate('recharge')">💳 Recharge</button>
-            <button class="btn-outline" style="color:var(--red);border-color:rgba(244,63,94,0.3)" onclick="handleLogout()">🚪 Logout</button>
+          <div style="overflow-x:auto"><table class="tbl">
+            <thead><tr><th>Name</th><th>Email</th><th>Balance</th><th>Numbers</th><th>SMS</th><th>Last Login</th><th>Joined</th><th>Role</th><th>Actions</th></tr></thead>
+            <tbody id="admin-users-tbody"><tr class="empty-row"><td colspan="9">Loading…</td></tr></tbody>
+          </table></div>
+        </div>
+      </div>
+
+      <!-- API SETTINGS PAGE -->
+      <div class="page" id="page-settings">
+        <div class="page-header"><div class="page-title">⚙ API Settings</div><div class="page-sub">Admin-only — API configuration and connection</div></div>
+        <div class="admin-warning">🔒 This page is restricted to admins. API credentials are never shown to regular users.</div>
+        <div class="settings-card">
+          <div class="setting-row">
+            <div class="setting-label">DurianRCS API Status</div>
+            <div class="status-indicator" id="conn-status">● Checking…</div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">API Endpoint</div>
+            <input type="text" class="form-input" value="https://api.durianrcs.com/out/ext_api/" readonly style="opacity:0.7">
+            <div class="setting-sub">API credentials are securely stored server-side.</div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">Auto-refresh OTP Interval</div>
+            <select class="form-select" id="refresh-interval" style="max-width:220px">
+              <option value="5000">Every 5 seconds</option>
+              <option value="10000" selected>Every 10 seconds</option>
+              <option value="15000">Every 15 seconds</option>
+              <option value="30000">Every 30 seconds</option>
+            </select>
+          </div>
+          <button class="btn-save" onclick="testApiConnection()">🔌 Test API Connection</button>
+        </div>
+      </div>
+
+      <!-- PROFILE PAGE -->
+      <div class="page" id="page-profile">
+        <div class="page-header"><div class="page-title">👤 Profile</div><div class="page-sub">Your account overview</div></div>
+        <div class="profile-grid">
+          <div class="profile-card">
+            <div class="profile-banner"></div>
+            <div class="profile-avatar-wrap">
+              <div class="profile-avatar" id="profile-avatar">?</div>
+            </div>
+            <div class="profile-info">
+              <div class="profile-name" id="profile-name">Loading…</div>
+              <div class="profile-handle" id="profile-handle">@…</div>
+              <div class="profile-stats">
+                <div class="profile-stat"><div class="profile-stat-val" id="profile-total-nums">0</div><div class="profile-stat-label">Numbers</div></div>
+                <div class="profile-stat"><div class="profile-stat-val" id="profile-total-sms">0</div><div class="profile-stat-label">SMS Rcvd</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">Account Details</div>
+            <div class="detail-list">
+              <div class="detail-item"><span class="detail-key">Name</span><span class="detail-val" id="profile-detail-user">—</span></div>
+              <div class="detail-item"><span class="detail-key">Email</span><span class="detail-val" id="profile-detail-email">—</span></div>
+              <div class="detail-item"><span class="detail-key">Balance</span><span class="detail-val" style="color:var(--green)" id="profile-balance">$0.00</span></div>
+              <div class="detail-item"><span class="detail-key">Last Login</span><span class="detail-val" id="last-login">—</span></div>
+              <div class="detail-item"><span class="detail-key">Cost Per Number</span><span class="detail-val" style="color:var(--yellow)">$0.17</span></div>
+              <div class="detail-item"><span class="detail-key">Exchange Rate</span><span class="detail-val" style="color:var(--accent)">1 USD = 130 ৳</span></div>
+            </div>
+            <div style="margin-top:20px;display:flex;gap:10px">
+              <button class="btn-outline" onclick="navigate('recharge')">💳 Recharge</button>
+              <button class="btn-outline" style="color:var(--red);border-color:rgba(244,63,94,0.3)" onclick="handleLogout()">🚪 Logout</button>
+            </div>
           </div>
         </div>
       </div>
-    </div>
 
-  </div>
+    </div><!-- /content -->
 
-  <footer class="footer">
-    <span>Developed by <strong style="color:var(--accent)">Mohammad Shanto</strong></span>
-    <span>© 2026 DurianSMS. All Rights Reserved.</span>
-    <span style="color:var(--green)">● System Online</span>
-  </footer>
-</div>
-</div>
+    <footer class="footer">
+      <span>Developed by <strong style="color:var(--accent)">Mohammad Shanto</strong></span>
+      <span>© 2026 DurianSMS. All Rights Reserved.</span>
+      <span style="color:var(--green)">● System Online</span>
+    </footer>
+  </div><!-- /main-wrapper -->
+</div><!-- /main-panel -->
 
 <div id="toast-container"></div>
 
 <script>
 window.searchHistory = function() { if(window._renderHistory) window._renderHistory(); };
-window.calcRecharge = window.calcRecharge || function(){};
 </script>
 </body>
 </html>
