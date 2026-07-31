@@ -1315,8 +1315,8 @@ async function getNumber(service, source) {
   resultEl.innerHTML = '';
 
   try {
-    const params = { pid, num: qty, noblack: 1, serial: Date.now() };
-    const res = await apiCall('getPhoneNum', params);
+    const params = { pid, num: qty, noblack: 1, serial: qty > 1 ? 1 : 2 };
+    const res = await apiCall('getMobile', params);
 
     if (res.code === 200) {
       const phones = Array.isArray(res.data) ? res.data : [res.data];
@@ -1433,7 +1433,7 @@ function startOtpPolling(phone, pid, service) {
 async function fetchOTP(phone, pid, service) {
   const key = phone.replace(/\D/g,'');
   try {
-    const res = await apiCall('getMsg', { pid, pn: phone, serial: Date.now() });
+    const res = await apiCall('getSms', { pid, pn: phone, serial: Date.now() });
     if (res.code === 200 && res.data) {
       const otp = res.data;
       // Update all OTP displays
@@ -1491,7 +1491,7 @@ async function refreshOTP(phone, pid, key) {
 async function releaseNumber(phone, pid) {
   if (!confirm(`Release number ${phone}?`)) return;
   try {
-    const res = await apiCall('releaseNum', { pid, pn: phone });
+    const res = await apiCall('release', { pid, pn: phone });
     if (res.code === 200) {
       showToast(`Released ${phone}`, 'success');
     } else {
@@ -1515,7 +1515,7 @@ async function releaseNumber(phone, pid) {
 // ══════════════════════════════════════════════════════════════
 async function addToBlacklist(phone, pid) {
   try {
-    const res = await apiCall('addBlack', { pid, pn: phone });
+    const res = await apiCall('addBlacklist', { pid, pn: phone });
     if (res.code === 200) {
       showToast(`${phone} added to blacklist`, 'success');
     } else {
