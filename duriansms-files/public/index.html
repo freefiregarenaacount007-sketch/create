@@ -1815,7 +1815,7 @@ async function testConnection() {
 // ══════════════════════════════════════════════════════════════
 async function testAllProxies() {
   var qp = new URLSearchParams({ name: API_CONFIG.name, ApiKey: API_CONFIG.ApiKey });
-  var directUrl = API_CONFIG.base + '/getUserInfo?' + qp;
+  var directUrl = API_CONFIG.base + 'getUserInfo?' + qp;
   var proxyNames = ['allorigins.win/raw','corsproxy.io','codetabs.com','cors.sh','allorigins.win/get'];
 
   var row = document.getElementById('proxy-status-row');
