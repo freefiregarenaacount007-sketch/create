@@ -692,8 +692,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <div class="form-group">
               <label class="form-label">Country</label>
               <select class="form-select" id="dash-fb-country">
-                <option value="1">🇺🇸 United States</option>
-                <option value="2">🇨🇦 Canada</option>
+                <option value="us">🇺🇸 United States</option>
+                <option value="ca">🇨🇦 Canada</option>
               </select>
             </div>
             <div class="form-group">
@@ -719,8 +719,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <div class="form-group">
               <label class="form-label">Country</label>
               <select class="form-select" id="dash-wa-country">
-                <option value="1">🇺🇸 United States</option>
-                <option value="2">🇨🇦 Canada</option>
+                <option value="us">🇺🇸 United States</option>
+                <option value="ca">🇨🇦 Canada</option>
               </select>
             </div>
             <div class="form-group">
@@ -776,8 +776,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <div class="form-group">
               <label class="form-label">Select Country</label>
               <select class="form-select" id="fb-country">
-                <option value="1">🇺🇸 United States (+1)</option>
-                <option value="2">🇨🇦 Canada (+1 CA)</option>
+                <option value="us">🇺🇸 United States (+1)</option>
+                <option value="ca">🇨🇦 Canada (+1 CA)</option>
               </select>
             </div>
             <div class="form-group">
@@ -827,8 +827,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <div class="form-group">
               <label class="form-label">Select Country</label>
               <select class="form-select" id="wa-country">
-                <option value="1">🇺🇸 United States (+1)</option>
-                <option value="2">🇨🇦 Canada (+1 CA)</option>
+                <option value="us">🇺🇸 United States (+1)</option>
+                <option value="ca">🇨🇦 Canada (+1 CA)</option>
               </select>
             </div>
             <div class="form-group">
@@ -1315,7 +1315,7 @@ async function getNumber(service, source) {
   resultEl.innerHTML = '';
 
   try {
-    const params = { pid, num: qty, noblack: 1, serial: qty > 1 ? 1 : 2 };
+    const params = { pid, num: qty, noblack: 1, serial: qty > 1 ? 1 : 2, cuy: country };
     const res = await apiCall('getMobile', params);
 
     if (res.code === 200) {
