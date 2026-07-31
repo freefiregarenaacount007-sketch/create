@@ -32,13 +32,13 @@ const _DC = {
   b: 'https://api.durianrcs.com/out/ext_api/'
 };
 
-// FIX: Better ordered proxy list — fastest/most reliable first
+// FIX: Use our own Netlify function proxy first (reliable, no third-party CORS blocks)
 const FALLBACK_PROXIES = [
-  (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  (u) => `/.netlify/functions/proxy?url=${encodeURIComponent(u)}`,
   (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
   (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
-  (u) => `https://proxy.cors.sh/${u}`,
+  (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
 ];
 
 let activeProxyIdx = -1;
@@ -602,7 +602,15 @@ window.submitRecharge = async function() {
     document.getElementById('calc-result').style.display = 'none';
     btn.disabled = true; // Reset — require new amount
     loadMyRechargeHistory();
-  } catch(e) { showToast('Error: ' + e.message, 'error'); }
+  } catch(e) {
+    console.error('submitRecharge failed:', e);
+    // FIX: surface permission errors clearly (usually a Firestore rules issue)
+    const msg = (e.code === 'permission-denied' || /permission/i.test(e.message))
+      ? 'Permission denied — Firestore security rules need to allow rechargeRequests writes. Contact support.'
+      : ('Error: ' + e.message);
+    showToast(msg, 'error');
+    btn.disabled = false;
+  }
   finally { btn.innerHTML = '✅ Submit Recharge Request'; }
 };
 
@@ -665,7 +673,12 @@ async function loadPendingRecharges() {
           : '—'}</td>
       </tr>`;
     }).join('');
-  } catch(e) { showToast('Error loading recharges: '+e.message,'error'); }
+  } catch(e) {
+    console.error('loadPendingRecharges failed:', e);
+    const tbody = document.getElementById('admin-recharge-tbody');
+    if (tbody) tbody.innerHTML = `<tr class="empty-row"><td colspan="10" style="color:var(--red)">Failed to load: ${esc(e.message)}${e.code==='permission-denied'?' — Firestore rules need updating (see firestore.rules).':''}</td></tr>`;
+    showToast('Error loading recharges: '+e.message,'error');
+  }
 }
 
 window.approveRecharge = async function(docId, uid, amount) {
